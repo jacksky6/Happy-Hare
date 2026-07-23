@@ -768,9 +768,11 @@ class MmuServer:
                 lane = gate
                 lane_key = f"lane{lane}"
 
-                # Check if gate is empty (status -1/unknown or 0/empty, or spool_id -1)
+                # Check if gate is empty (status -1/unknown or 0/empty).
+                # A gate can still have valid local filament metadata without
+                # a Spoolman spool_id, so do not treat spool_id -1 as empty.
                 gate_status_val = gate_status[gate] if gate < len(gate_status) else -1
-                is_empty = gate_status_val in [-1, 0] or spool_id == -1
+                is_empty = gate_status_val in [-1, 0]
 
                 if is_empty:
                     # Empty gate format
