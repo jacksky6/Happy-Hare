@@ -185,6 +185,11 @@ class MmuGateMaps:
             elif self.p.spoolman_support == SPOOLMAN_READONLY:
                 self.mmu._spoolman_update_filaments(gate_ids)
 
+        # Keep Moonraker's lane_data database in sync for slicers such as
+        # OrcaSlicer. If no specific gate list is available, push the full gate
+        # map so metadata-only edits (name/material/color/temp) still refresh.
+        self.mmu._moonraker_push_lane_data(gate_ids if gate_ids else None)
+
         self.mmu.led_manager.gate_map_changed(None) # Force full LED update
         self.mmu.mmu_macro_event(MACRO_EVENT_GATE_MAP_CHANGED, "GATE=-1")
 
@@ -288,6 +293,7 @@ class MmuGateMaps:
                 self.persist_gate_status()
                 self.mmu.led_manager.gate_map_changed(gate)
                 self.mmu.mmu_macro_event(MACRO_EVENT_GATE_MAP_CHANGED, "GATE=%d" % gate)
+                self.mmu._moonraker_push_lane_data([(gate, self.gate_spool_id[gate])])
 
 
     def reset_gate_map(self):

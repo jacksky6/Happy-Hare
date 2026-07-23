@@ -1637,6 +1637,8 @@ class MmuController(MmuFilamentMovement):
             elif self.p.spoolman_support == SPOOLMAN_READONLY:
                 self._spoolman_update_filaments(mod_gate_ids)
 
+            self._moonraker_push_lane_data(mod_gate_ids)
+
         # Disable timer to prevent reuse
         self.pending_spool_id = -1
         self.reactor.update_timer(self.pending_spool_id_timer, self.reactor.NEVER)
