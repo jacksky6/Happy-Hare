@@ -202,11 +202,63 @@ class TestReaderErrorState(unittest.TestCase):
         self.assertEqual(reader.get_status()['i2c_error_count'], 1)
 
 
+class SamConfigChip:
+    def __init__(self, result=True):
+        self.result = result
+        self.calls = 0
+
+    def sam_config(self):
+        self.calls += 1
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+def preflight_reader(chip, reader_type='pn532', interface='i2c'):
+    reader = MmuNfcReader.__new__(MmuNfcReader)
+    reader.reader = chip
+    reader.reader_type = reader_type
+    reader.interface = interface
+    reader.rx_gain = 0
+    reader.alive = False
+    return reader
+
+
+class TestReaderHomingPreflight(unittest.TestCase):
+    def test_pn532_i2c_preflight_sends_sam_configuration(self):
+        chip = SamConfigChip(True)
+        reader = preflight_reader(chip)
+
+        self.assertIsNone(reader.prepare_homing())
+        self.assertEqual(chip.calls, 1)
+        self.assertTrue(reader.alive)
+
+    def test_pn532_i2c_preflight_reports_a_missing_response(self):
+        chip = SamConfigChip(False)
+        reader = preflight_reader(chip)
+
+        self.assertEqual(reader.prepare_homing(),
+                         ('SAMConfiguration', 'no response'))
+        self.assertEqual(chip.calls, 1)
+        self.assertFalse(reader.alive)
+
+    def test_other_readers_are_not_touched_by_homing_preflight(self):
+        chip = SamConfigChip(True)
+        reader = preflight_reader(chip, reader_type='pn7160')
+
+        self.assertIsNone(reader.prepare_homing())
+        self.assertEqual(chip.calls, 0)
+
+
 class FakeMmu:
     def __init__(self):
         self.warnings = []
         self.errors = []
         self.debug = []
+        self.info = []
+
+    def log_info(self, message):
+        self.info.append(message)
 
     def log_warning(self, message):
         self.warnings.append(message)
@@ -274,6 +326,55 @@ def manager_with(reader):
 
 
 class TestManagerErrorBoundary(unittest.TestCase):
+    def test_homing_preflight_reinitializes_before_starting_probe(self):
+        reader = ManagerReader([])
+        preflight_results = deque([
+            ('SAMConfiguration', 'no response'),
+            None,
+        ])
+        reader.prepare_homing = lambda: preflight_results.popleft()
+        init_gates = []
+
+        def init(gate):
+            init_gates.append(gate)
+            return True
+
+        reader.init = init
+        endstop = FakeEndstop(reader)
+        manager = manager_with(reader)
+
+        manager.start_homing_poll(endstop)
+
+        self.assertEqual(init_gates, [3])
+        self.assertEqual(reader.probe_starts, 1,
+                         'a successful recovery must arm the normal probe')
+        self.assertIsNone(manager._homing_probe_error)
+        self.assertIn('SAMConfiguration preflight failed', manager.mmu.warnings[0])
+        self.assertIn('initialization succeeded', manager.mmu.info[0])
+
+    def test_homing_preflight_failure_triggers_without_starting_probe(self):
+        reader = ManagerReader([])
+        preflight_results = deque([
+            ('SAMConfiguration', 'START_NACK'),
+            ('SAMConfiguration', 'START_NACK'),
+        ])
+        reader.prepare_homing = lambda: preflight_results.popleft()
+        reader.init = lambda gate: True
+        endstop = FakeEndstop(reader)
+        manager = manager_with(reader)
+
+        manager.start_homing_poll(endstop)
+
+        self.assertEqual(reader.probe_starts, 0,
+                         'a failed recovery must not start an NFC scan')
+        self.assertIsNotNone(manager._homing_probe_error)
+        self.assertEqual(manager._homing_poll(20.0), manager.reactor.NEVER)
+        self.assertEqual(endstop.triggers, [(20.0, True)])
+        self.assertTrue(any('initialization failed' in warning
+                            for warning in manager.mmu.warnings))
+        self.assertTrue(any('treated as triggered' in warning
+                            for warning in manager.mmu.warnings))
+
     def test_normal_read_becomes_warning_and_no_tag(self):
         error = status_error(status='NACK')
         reader = ManagerReader([error])

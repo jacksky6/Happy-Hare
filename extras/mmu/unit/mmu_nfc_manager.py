@@ -922,11 +922,83 @@ class MmuNfcManager:
         return NFC_HOMING_POLL_INTERVAL_SHIM
 
 
+    def _prepare_homing_reader(self, endstop):
+        """Prepare a per-gate reader before its NFC homing move starts.
+
+        Currently only MmuNfcReader's PN532/I2C path implements prepare_homing().
+        Other reader types deliberately remain untouched, and shared-reader
+        polling never calls this method.
+        """
+        reader = endstop.reader
+        prepare = getattr(reader, 'prepare_homing', None)
+        if not callable(prepare):
+            return True
+        try:
+            failure = prepare()
+        except Exception as e:
+            failure = ('preflight', e)
+        if failure is None:
+            return True
+
+        try:
+            stage, cause = failure
+        except (TypeError, ValueError):
+            stage, cause = 'preflight', failure
+        name = getattr(reader, 'name', '?')
+        self.mmu.log_warning(
+            "NFC warning: gate %d reader '%s' %s preflight failed (%s); "
+            "attempting PN532 initialization."
+            % (endstop.gate, name, stage, str(cause)))
+
+        try:
+            alive = bool(reader.init(endstop.gate))
+        except Exception as e:
+            self.mmu.log_warning(
+                "NFC warning: gate %d reader '%s' PN532 initialization failed (%s); "
+                "NFC homing will be treated as triggered."
+                % (endstop.gate, name, str(e)))
+            return False
+        if not alive:
+            self.mmu.log_warning(
+                "NFC warning: gate %d reader '%s' PN532 initialization failed at "
+                "GetFirmwareVersion (no response); NFC homing will be treated as triggered."
+                % (endstop.gate, name))
+            return False
+
+        # reader.init() performs SAMConfiguration as part of its normal sequence,
+        # but its historical API only returns the final firmware liveness result.
+        # Run the same real control-plane command once more to prove that the
+        # recovery left the chip in scan-ready Normal mode, not merely reachable.
+        try:
+            verification = prepare()
+        except Exception as e:
+            verification = ('SAMConfiguration', e)
+        if verification is None:
+            self.mmu.log_info(
+                "NFC: gate %d reader '%s' PN532 initialization succeeded; "
+                "SAMConfiguration Normal verified; starting tag homing."
+                % (endstop.gate, name))
+            return True
+
+        try:
+            stage, cause = verification
+        except (TypeError, ValueError):
+            stage, cause = 'post-initialization preflight', verification
+        self.mmu.log_warning(
+            "NFC warning: gate %d reader '%s' PN532 initialization failed at %s (%s); "
+            "NFC homing will be treated as triggered."
+            % (endstop.gate, name, stage, str(cause)))
+        return False
+
+
     def start_homing_poll(self, endstop):
         """
-        Begin ticking a presence probe on 'endstop's reader. Clears the sticky
-        UID first so nothing stale can be mistaken for this home's detection,
-        then kicks off the first scan. Called from home_start.
+        Prepare and then begin ticking a presence probe on 'endstop's reader.
+        The PN532/I2C preflight runs before motion starts; if it cannot be
+        recovered with one initialization, the first timer tick completes this
+        homing move as a virtual trigger without starting a scan. Clears the
+        sticky UID first so nothing stale can be mistaken for this home's
+        detection, then kicks off the first scan. Called from home_start.
 
         Homing is deliberate so it overrides the 'active' guard, but a *disabled*
         reader can't be read - refuse clearly rather than let the move run its
@@ -940,8 +1012,15 @@ class MmuNfcManager:
                 "(re-enable with MMU_NFC ... ENABLE=1)" % endstop.gate)
             return # Don't arm; the move will run full and home_wait reports no trigger
         self._homing_endstop = endstop
-        self._probe_reader = endstop.reader
+        self._probe_reader = None
         self._homing_probe_error = None
+        if not self._prepare_homing_reader(endstop):
+            # home_start() has not yet armed the virtual-endstop completion. The
+            # first timer tick below completes it without attempting a scan.
+            self._homing_probe_error = True
+            self.reactor.update_timer(self._homing_poll_timer, self.reactor.NOW)
+            return
+        self._probe_reader = endstop.reader
         try:
             endstop.reader.clear_uid()
             endstop.reader.probe_start()

@@ -372,12 +372,46 @@ class MmuNfcReader:
     def _apply_rx_gain(self):
         """Apply the static startup gain after the driver's reset/init sequence."""
         if not self.rx_gain:
-            return
+            return True
         set_rx_gain = getattr(self.reader, 'set_rx_gain', None)
         if set_rx_gain is None or not set_rx_gain(self.rx_gain):
             reader_log.warning(
                 "[mmu_nfc_reader %s] rx_gain=%ddB was not applied by %s",
                 self.name, self.rx_gain, self.reader_type)
+            return False
+        return True
+
+
+    def prepare_homing(self):
+        """Put a PN532/I2C reader into its scan-ready state before a homing move.
+
+        A PN532 can acknowledge miscellaneous commands immediately after a reset
+        while still being in LowVbat mode.  SAMConfiguration(Normal) is therefore
+        deliberately an action, not a cached ``alive`` check: it verifies the
+        current transport exchange and puts the chip back in initiator mode.
+
+        Returns ``None`` when the reader is ready (or when this is not a PN532/I2C
+        reader).  On a recoverable preflight failure returns ``(stage, cause)``;
+        the NFC manager then reports it and performs one complete initialization
+        before deciding whether this homing move may scan.
+        """
+        if self.reader_type != 'pn532' or self.interface != 'i2c':
+            return None
+        try:
+            if not self.reader.sam_config():
+                self.alive = False
+                return ('SAMConfiguration', 'no response')
+            if not self._apply_rx_gain():
+                self.alive = False
+                return ('RxGain', 'configured receive gain was not applied')
+        except pn532_driver.PN532I2CStatusError as e:
+            self.record_communication_error(e)
+            return ('SAMConfiguration', e)
+        except Exception as e:
+            self.alive = False
+            return ('SAMConfiguration', e)
+        self._record_communication_success()
+        return None
 
 
     def read(self, timeout=0.5):
