@@ -88,6 +88,11 @@ class MmuNfcManager:
         # is dropped the instant a tag is detected) and covers the window in which
         # the chip must not be disturbed.
         self._probe_reader = None
+        # A gate NFC operation prepares its reader before any arbitration read. The
+        # result remains valid for its whole synchronous operation so every homing
+        # leg uses the same outcome instead of issuing another SAMConfiguration.
+        self._gate_nfc_operations = {}
+        self._homing_transport_error_gate = None
 
         # Per-reader control flags:
         #   enabled - top-level on/off. If disabled a reader is never read (poll,
@@ -123,6 +128,8 @@ class MmuNfcManager:
         self._last_uid = None   # UID currently "held" (deduped)
         self._hold_until = 0.0  # Monotonic time until which reads are ignored (cooldown)
         self._homing_probe_error = None
+        self._gate_nfc_operations = {}
+        self._homing_transport_error_gate = None
         # Safety net: a probe reference that somehow outlived its drain would keep the
         # shared-reader poll suppressed indefinitely (see _movement_active). reinit only
         # runs on MMU enable/init, never mid-operation, so nothing legitimately pending
@@ -296,6 +303,14 @@ class MmuNfcManager:
         That is intended - do not replicate that guard here or the post-move deep read
         is silently disabled.
         """
+        if self._homing_transport_error_gate == gate:
+            # A virtual NFC trigger means the reader never detected a tag. In
+            # particular, do not turn the post-home UID/deep read into another
+            # I2C access after the failure that caused this homing completion.
+            self._homing_transport_error_gate = None
+            self.mmu.log_debug(
+                "NFC: gate %s skipping post-home tag read after NFC communication failure" % gate)
+            return None
         if not self.has_gate_nfc_reader(gate):
             return None
         # Drain the move queue before touching the reader. move_filament() already
@@ -922,45 +937,45 @@ class MmuNfcManager:
         return NFC_HOMING_POLL_INTERVAL_SHIM
 
 
-    def _prepare_homing_reader(self, endstop):
-        """Prepare a per-gate reader before its NFC homing move starts.
+    def _prepare_gate_reader_for_scan(self, endstop):
+        """Prepare a per-gate reader before an NFC operation uses it.
 
-        Currently only MmuNfcReader's PN532/I2C path implements prepare_homing().
+        Currently only MmuNfcReader's PN532/I2C path implements prepare_for_scan().
         Other reader types deliberately remain untouched, and shared-reader
         polling never calls this method.
         """
         reader = endstop.reader
-        prepare = getattr(reader, 'prepare_homing', None)
+        prepare = getattr(reader, 'prepare_for_scan', None)
         if not callable(prepare):
             return True
         try:
             failure = prepare()
         except Exception as e:
-            failure = ('preflight', e)
+            failure = ('scan preparation', e)
         if failure is None:
             return True
 
         try:
             stage, cause = failure
         except (TypeError, ValueError):
-            stage, cause = 'preflight', failure
+            stage, cause = 'scan preparation', failure
         name = getattr(reader, 'name', '?')
         self.mmu.log_warning(
-            "NFC warning: gate %d reader '%s' %s preflight failed (%s); "
-            "attempting PN532 initialization."
+            "NFC warning: gate %d reader '%s' scan preparation failed at %s (%s); "
+            "attempting PN532 recovery initialization."
             % (endstop.gate, name, stage, str(cause)))
 
         try:
             alive = bool(reader.init(endstop.gate))
         except Exception as e:
             self.mmu.log_warning(
-                "NFC warning: gate %d reader '%s' PN532 initialization failed (%s); "
+                "NFC warning: gate %d reader '%s' PN532 recovery initialization failed (%s); "
                 "NFC homing will be treated as triggered."
                 % (endstop.gate, name, str(e)))
             return False
         if not alive:
             self.mmu.log_warning(
-                "NFC warning: gate %d reader '%s' PN532 initialization failed at "
+                "NFC warning: gate %d reader '%s' PN532 recovery initialization failed at "
                 "GetFirmwareVersion (no response); NFC homing will be treated as triggered."
                 % (endstop.gate, name))
             return False
@@ -975,30 +990,59 @@ class MmuNfcManager:
             verification = ('SAMConfiguration', e)
         if verification is None:
             self.mmu.log_info(
-                "NFC: gate %d reader '%s' PN532 initialization succeeded; "
-                "SAMConfiguration Normal verified; starting tag homing."
+                "NFC: gate %d reader '%s' PN532 recovery initialization succeeded; "
+                "SAMConfiguration Normal verified; continuing NFC operation."
                 % (endstop.gate, name))
             return True
 
         try:
             stage, cause = verification
         except (TypeError, ValueError):
-            stage, cause = 'post-initialization preflight', verification
+            stage, cause = 'post-initialization scan preparation', verification
         self.mmu.log_warning(
-            "NFC warning: gate %d reader '%s' PN532 initialization failed at %s (%s); "
+            "NFC warning: gate %d reader '%s' PN532 recovery initialization failed at %s (%s); "
             "NFC homing will be treated as triggered."
             % (endstop.gate, name, stage, str(cause)))
         return False
 
 
+    def begin_gate_nfc_operation(self, gate):
+        """Prepare a per-gate reader before this operation's first NFC command.
+
+        The caller must pair this with end_gate_nfc_operation(). The saved result
+        lets all NFC homing legs in that operation reuse this preparation instead
+        of repeating it after field arbitration has already touched the reader.
+        """
+        endstop = self.get_gate_endstop(gate)
+        if endstop is None:
+            return True
+        ready = self._prepare_gate_reader_for_scan(endstop)
+        self._gate_nfc_operations[gate] = (endstop.reader, ready)
+        return ready
+
+
+    def end_gate_nfc_operation(self, gate):
+        """Discard the operation-scoped scan-preparation result for ``gate``."""
+        self._gate_nfc_operations.pop(gate, None)
+
+
+    def _operation_scan_ready(self, endstop):
+        """Return the current operation's preparation result, or None if absent."""
+        operation = getattr(self, '_gate_nfc_operations', {}).get(endstop.gate)
+        if operation is None or operation[0] is not endstop.reader:
+            return None
+        return operation[1]
+
+
     def start_homing_poll(self, endstop):
         """
-        Prepare and then begin ticking a presence probe on 'endstop's reader.
-        The PN532/I2C preflight runs before motion starts; if it cannot be
-        recovered with one initialization, the first timer tick completes this
-        homing move as a virtual trigger without starting a scan. Clears the
-        sticky UID first so nothing stale can be mistaken for this home's
-        detection, then kicks off the first scan. Called from home_start.
+        Begin ticking a presence probe on 'endstop's reader. A surrounding gate
+        NFC operation normally prepared the reader before any field arbitration;
+        direct callers retain preparation here as a fallback. If preparation
+        cannot be recovered with one initialization, the first timer tick
+        completes this homing move as a virtual trigger without starting a scan.
+        Clears the sticky UID first so nothing stale can be mistaken for this
+        home's detection, then kicks off the first scan. Called from home_start.
 
         Homing is deliberate so it overrides the 'active' guard, but a *disabled*
         reader can't be read - refuse clearly rather than let the move run its
@@ -1014,7 +1058,11 @@ class MmuNfcManager:
         self._homing_endstop = endstop
         self._probe_reader = None
         self._homing_probe_error = None
-        if not self._prepare_homing_reader(endstop):
+        self._homing_transport_error_gate = None
+        ready = self._operation_scan_ready(endstop)
+        if ready is None:
+            ready = self._prepare_gate_reader_for_scan(endstop)
+        if not ready:
             # home_start() has not yet armed the virtual-endstop completion. The
             # first timer tick below completes it without attempting a scan.
             self._homing_probe_error = True
@@ -1057,6 +1105,7 @@ class MmuNfcManager:
 
     def _complete_homing_on_communication_error(self, endstop, eventtime):
         """End the move on a NFC transport fault without treating it as MMU failure."""
+        self._homing_transport_error_gate = endstop.gate
         self._disarm_homing_poll()
         endstop.trigger_handler(eventtime, True)
         return self.reactor.NEVER

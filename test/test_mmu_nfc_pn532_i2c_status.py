@@ -214,7 +214,7 @@ class SamConfigChip:
         return self.result
 
 
-def preflight_reader(chip, reader_type='pn532', interface='i2c'):
+def scan_ready_reader(chip, reader_type='pn532', interface='i2c'):
     reader = MmuNfcReader.__new__(MmuNfcReader)
     reader.reader = chip
     reader.reader_type = reader_type
@@ -224,29 +224,29 @@ def preflight_reader(chip, reader_type='pn532', interface='i2c'):
     return reader
 
 
-class TestReaderHomingPreflight(unittest.TestCase):
-    def test_pn532_i2c_preflight_sends_sam_configuration(self):
+class TestReaderScanPreparation(unittest.TestCase):
+    def test_pn532_i2c_scan_preparation_sends_sam_configuration(self):
         chip = SamConfigChip(True)
-        reader = preflight_reader(chip)
+        reader = scan_ready_reader(chip)
 
-        self.assertIsNone(reader.prepare_homing())
+        self.assertIsNone(reader.prepare_for_scan())
         self.assertEqual(chip.calls, 1)
         self.assertTrue(reader.alive)
 
-    def test_pn532_i2c_preflight_reports_a_missing_response(self):
+    def test_pn532_i2c_scan_preparation_reports_a_missing_response(self):
         chip = SamConfigChip(False)
-        reader = preflight_reader(chip)
+        reader = scan_ready_reader(chip)
 
-        self.assertEqual(reader.prepare_homing(),
+        self.assertEqual(reader.prepare_for_scan(),
                          ('SAMConfiguration', 'no response'))
         self.assertEqual(chip.calls, 1)
         self.assertFalse(reader.alive)
 
-    def test_other_readers_are_not_touched_by_homing_preflight(self):
+    def test_other_readers_are_not_touched_by_scan_preparation(self):
         chip = SamConfigChip(True)
-        reader = preflight_reader(chip, reader_type='pn7160')
+        reader = scan_ready_reader(chip, reader_type='pn7160')
 
-        self.assertIsNone(reader.prepare_homing())
+        self.assertIsNone(reader.prepare_for_scan())
         self.assertEqual(chip.calls, 0)
 
 
@@ -321,18 +321,36 @@ def manager_with(reader):
     manager._homing_poll_timer = object()
     manager._homing_endstop = None
     manager._homing_probe_error = None
+    manager._homing_transport_error_gate = None
+    manager._gate_nfc_operations = {}
     manager.is_enabled = lambda gate: True
     return manager
 
 
 class TestManagerErrorBoundary(unittest.TestCase):
-    def test_homing_preflight_reinitializes_before_starting_probe(self):
+    def test_operation_scan_preparation_is_reused_by_homing_poll(self):
         reader = ManagerReader([])
-        preflight_results = deque([
+        preparation_calls = []
+        reader.prepare_for_scan = lambda: preparation_calls.append(True) or None
+        endstop = FakeEndstop(reader)
+        manager = manager_with(reader)
+        manager.gate_endstops = {3: endstop}
+
+        self.assertTrue(manager.begin_gate_nfc_operation(3))
+        manager.start_homing_poll(endstop)
+        manager.end_gate_nfc_operation(3)
+
+        self.assertEqual(preparation_calls, [True],
+                         'homing must reuse preparation performed before field arbitration')
+        self.assertEqual(reader.probe_starts, 1)
+
+    def test_homing_scan_preparation_reinitializes_before_starting_probe(self):
+        reader = ManagerReader([])
+        preparation_results = deque([
             ('SAMConfiguration', 'no response'),
             None,
         ])
-        reader.prepare_homing = lambda: preflight_results.popleft()
+        reader.prepare_for_scan = lambda: preparation_results.popleft()
         init_gates = []
 
         def init(gate):
@@ -349,16 +367,16 @@ class TestManagerErrorBoundary(unittest.TestCase):
         self.assertEqual(reader.probe_starts, 1,
                          'a successful recovery must arm the normal probe')
         self.assertIsNone(manager._homing_probe_error)
-        self.assertIn('SAMConfiguration preflight failed', manager.mmu.warnings[0])
-        self.assertIn('initialization succeeded', manager.mmu.info[0])
+        self.assertIn('scan preparation failed at SAMConfiguration', manager.mmu.warnings[0])
+        self.assertIn('recovery initialization succeeded', manager.mmu.info[0])
 
-    def test_homing_preflight_failure_triggers_without_starting_probe(self):
+    def test_homing_scan_preparation_failure_triggers_without_starting_probe(self):
         reader = ManagerReader([])
-        preflight_results = deque([
+        preparation_results = deque([
             ('SAMConfiguration', 'START_NACK'),
             ('SAMConfiguration', 'START_NACK'),
         ])
-        reader.prepare_homing = lambda: preflight_results.popleft()
+        reader.prepare_for_scan = lambda: preparation_results.popleft()
         reader.init = lambda gate: True
         endstop = FakeEndstop(reader)
         manager = manager_with(reader)
@@ -421,6 +439,16 @@ class TestManagerErrorBoundary(unittest.TestCase):
         self.assertEqual(manager._homing_poll(21.0), manager.reactor.NEVER)
         self.assertEqual(endstop.triggers, [(21.0, True)])
         self.assertEqual(len(manager.mmu.warnings), 1)
+
+    def test_virtual_homing_trigger_skips_the_post_home_read(self):
+        reader = ManagerReader([])
+        manager = manager_with(reader)
+        manager._homing_transport_error_gate = 3
+
+        self.assertIsNone(manager.read_gate_after_home(3))
+        self.assertIsNone(manager._homing_transport_error_gate)
+        self.assertTrue(any('skipping post-home tag read' in message
+                            for message in manager.mmu.debug))
 
 
 if __name__ == '__main__':

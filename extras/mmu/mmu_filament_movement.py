@@ -220,14 +220,23 @@ class MmuFilamentMovement:
         has_material = tag is not None and isinstance(tag[1], dict) and tag[1].get('material')
         have_strong_pending = spool_id > 0 or has_material
 
-        # A neighboring gate's spool could satisfy the NFC leg below and get misattributed -
-        # settle field ownership first. arb_mgr stays None (inert) if we wouldn't attempt an
-        # NFC leg anyway (strong pending, or encoder homing).
-        arb_mgr = None
+        # Prepare before any reader I/O, including optional neighbor-field arbitration.
+        # A failed preparation deliberately leaves the field unchecked: it must not turn
+        # into a normal UID read before the virtual NFC homing trigger handles the fault.
+        operation_nfc_mgr = None
+        operation_nfc_ready = True
         if not have_strong_pending and profile.endstop != SENSOR_ENCODER:
-            arb_mgr = self._nfc_field_arm(gate, profile.endstop, profile.clear_distance)
+            operation_nfc_mgr = self._gate_nfc_reader(gate)
+            if operation_nfc_mgr is not None:
+                operation_nfc_ready = operation_nfc_mgr.begin_gate_nfc_operation(gate)
+        arb_mgr = (
+            self._nfc_field_arm(gate, profile.endstop, profile.clear_distance)
+            if operation_nfc_ready else None)
+        operation_cleanup = contextlib.ExitStack()
+        if operation_nfc_mgr is not None:
+            operation_cleanup.callback(operation_nfc_mgr.end_gate_nfc_operation, gate)
 
-        with self.nfc_arbiter.clear_field(
+        with operation_cleanup, self.nfc_arbiter.clear_field(
                 gate, arb_mgr, endstop=profile.endstop,
                 clear_distance=profile.clear_distance,
                 parking_distance=profile.parking_distance,
@@ -803,10 +812,18 @@ class MmuFilamentMovement:
             for mgr in [unit.nfc_manager] if mgr is not None
         ]
 
+        # Prepare before any reader I/O, including field arbitration and the fast
+        # read path. A failed preparation makes this operation NFC-silent; its
+        # virtual NFC endstop completions then report no tag without retrying I2C.
+        operation_nfc_ready = nfc_manager.begin_gate_nfc_operation(gate)
+
         # Settle field ownership before trusting the fast path or sweep - unlike preload, an
         # unattributable verdict fails the command outright (there's nothing else to report).
-        arb_mgr = self._nfc_field_arm(gate, clear_distance=profile.clear_distance)
-        with self.nfc_arbiter.clear_field(
+        arb_mgr = (self._nfc_field_arm(gate, clear_distance=profile.clear_distance)
+                   if operation_nfc_ready else None)
+        operation_cleanup = contextlib.ExitStack()
+        operation_cleanup.callback(nfc_manager.end_gate_nfc_operation, gate)
+        with operation_cleanup, self.nfc_arbiter.clear_field(
                 gate, arb_mgr, endstop=profile.endstop,
                 clear_distance=profile.clear_distance,
                 parking_distance=profile.parking_distance,
@@ -829,7 +846,7 @@ class MmuFilamentMovement:
                 # clear_field()'s ratification re-probe to observe, so the sweep below is
                 # forced to run instead - it's the only thing that can actually tell this
                 # gate's own tag apart from an unregistered neighbor's.
-                if outcome.verdict != NFC_FIELD_PROVISIONAL:
+                if operation_nfc_ready and outcome.verdict != NFC_FIELD_PROVISIONAL:
                     nfc_manager.clear_gate_reader(gate)
                     if nfc_manager.read_gate(gate):
                         found = True

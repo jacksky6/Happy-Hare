@@ -382,8 +382,8 @@ class MmuNfcReader:
         return True
 
 
-    def prepare_homing(self):
-        """Put a PN532/I2C reader into its scan-ready state before a homing move.
+    def prepare_for_scan(self):
+        """Put a PN532/I2C reader into its scan-ready state before it is used.
 
         A PN532 can acknowledge miscellaneous commands immediately after a reset
         while still being in LowVbat mode.  SAMConfiguration(Normal) is therefore
@@ -391,9 +391,9 @@ class MmuNfcReader:
         current transport exchange and puts the chip back in initiator mode.
 
         Returns ``None`` when the reader is ready (or when this is not a PN532/I2C
-        reader).  On a recoverable preflight failure returns ``(stage, cause)``;
-        the NFC manager then reports it and performs one complete initialization
-        before deciding whether this homing move may scan.
+        reader). On a recoverable scan-preparation failure returns ``(stage, cause)``;
+        the NFC manager then reports it and performs one complete recovery
+        initialization before deciding whether the operation may scan.
         """
         if self.reader_type != 'pn532' or self.interface != 'i2c':
             return None

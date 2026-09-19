@@ -118,6 +118,59 @@ class TestVirtualReader(NfcScanTestCase):
         self.assertGreater(self.hh.chip(0).reads, before)
 
 
+class TestPreparationBeforeFieldProbe(NfcScanTestCase):
+    def test_preload_prepares_reader_before_neighbor_field_probe(self):
+        manager = self.hh.mmu.mmu_unit(0).nfc_manager
+        self.hh.mmu.mmu_unit(0).p.nfc_neighbor_check = 1
+        events = []
+        begin_operation = manager.begin_gate_nfc_operation
+        probe_field = manager.probe_gate_field
+
+        def record_begin(gate):
+            events.append('prepare')
+            return begin_operation(gate)
+
+        def record_probe(gate, reads=None):
+            events.append('field_probe')
+            return probe_field(gate, reads=reads)
+
+        manager.begin_gate_nfc_operation = record_begin
+        manager.probe_gate_field = record_probe
+        self.hh.place_filament(0, position=-120.0)
+        self.hh.run_gcode('MMU_PRELOAD GATE=0')
+
+        self.assertIn('prepare', events)
+        self.assertIn('field_probe', events)
+        self.assertLess(events.index('prepare'), events.index('field_probe'))
+        self.assertEqual(self.hh.errors, [])
+
+    def test_scan_prepares_reader_before_neighbor_field_probe(self):
+        manager = self.hh.mmu.mmu_unit(0).nfc_manager
+        self.hh.mmu.mmu_unit(0).p.nfc_neighbor_check = 1
+        events = []
+        begin_operation = manager.begin_gate_nfc_operation
+        probe_field = manager.probe_gate_field
+
+        def record_begin(gate):
+            events.append('prepare')
+            return begin_operation(gate)
+
+        def record_probe(gate, reads=None):
+            events.append('field_probe')
+            return probe_field(gate, reads=reads)
+
+        manager.begin_gate_nfc_operation = record_begin
+        manager.probe_gate_field = record_probe
+        self.preload(0)
+        self.hh.mmu.select_gate(0)
+        self.hh.run_gcode('MMU_NFC_SCAN GATE=0')
+
+        self.assertIn('prepare', events)
+        self.assertIn('field_probe', events)
+        self.assertLess(events.index('prepare'), events.index('field_probe'))
+        self.assertEqual(self.hh.errors, [])
+
+
 class TestJogScanFindsTag(NfcScanTestCase):
     """MMU_NFC_SCAN: jog the filament past the reader until the tag is seen."""
 
