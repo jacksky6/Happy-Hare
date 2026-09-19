@@ -256,10 +256,8 @@ class TestProbeContractShape(unittest.TestCase):
 # PN7160 - the polled (no irq_pin) probe
 # =============================================================================
 #
-# The harness fake (test/hh/klippy_root/extras/bus.py) can't drive these: its
-# _I2CTransferCmd.send() takes no 'retry' kwarg and its reply carries no
-# i2c_bus_status, which is the very field the polled probe reads. A local fake also lets
-# a test OMIT i2c_transfer_cmd, which is how the "old firmware" gate is exercised.
+# These use a local fake so each test can precisely script SUCCESS/NACK replies and
+# omit i2c_transfer_cmd entirely, which is how the "old firmware" gate is exercised.
 
 NACK = object()      # Script marker: the NFCC NACKed this read (nothing to say)
 NOSTATUS = object()  # Script marker: SUCCESS-shaped reply carrying no status key

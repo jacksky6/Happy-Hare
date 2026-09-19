@@ -103,13 +103,16 @@ class MCU_I2C(_BusRecorder):
 
 
 class _I2CTransferCmd:
-    """pn7160_driver.py calls `i2c_transfer_cmd.send([oid, data])`."""
+    """Drivers call the raw transfer command to inspect the MCU bus status."""
 
     def __init__(self, owner):
         self._owner = owner
 
-    def send(self, args, minclock=0, reqclock=0):
-        return {'response': self._owner._next('i2c_transfer', list(args))}
+    def send(self, args, minclock=0, reqclock=0, retry=True):
+        return {
+            'i2c_bus_status': 'SUCCESS',
+            'response': self._owner._next('i2c_transfer', list(args)),
+        }
 
 
 def _lookup_sw_pins(config, prefix, names):

@@ -280,6 +280,10 @@ class MmuNfcReader:
         # Why the last deep read produced no metadata, or None if it did not fail.
         # Distinguishes "parse/auth failed" from "tag carries no rich data".
         self.last_deep_error = None
+        self.last_error = None
+        self.last_error_time = None
+        self.i2c_error_count = 0
+        self._last_error_object = None
 
         # Register for NAME-based GCode dispatch, replacing any stale same-named
         # instance (e.g. after a restart)
@@ -319,6 +323,24 @@ class MmuNfcReader:
 
     # ---- Public Python API (no gcmd required) -----------------------------
 
+    def record_communication_error(self, error):
+        """Record a non-fatal reader transport error for status and diagnostics."""
+        if error is self._last_error_object:
+            return
+        self._last_error_object = error
+        if hasattr(error, 'as_dict'):
+            self.last_error = error.as_dict()
+        else:
+            self.last_error = {'message': str(error) or error.__class__.__name__}
+        self.last_error_time = self.reactor.monotonic()
+        self.i2c_error_count += 1
+        self.alive = False
+
+    def _record_communication_success(self):
+        # A prior error remains in last_error as history, but a successful live
+        # transaction proves the reader is currently reachable again.
+        self.alive = True
+
     def init(self, gate=None):
         """(Re)initialize the reader chip.
 
@@ -337,9 +359,13 @@ class MmuNfcReader:
         self.last_uid = None
         self.last_target_info = None
         self.present = False
-        self.reader.init()
-        self._apply_rx_gain()
-        self.alive = bool(self.reader.is_alive())
+        try:
+            self.reader.init()
+            self._apply_rx_gain()
+            self.alive = bool(self.reader.is_alive())
+        except pn532_driver.PN532I2CStatusError as e:
+            self.record_communication_error(e)
+            raise
         return self.alive
 
 
@@ -364,13 +390,18 @@ class MmuNfcReader:
         """
         uid = None
         target_info = None
-        read_target = getattr(self.reader, 'read_target', None)
-        if read_target is not None:
-            target_info = read_target(timeout=timeout)
-            if target_info is not None:
-                uid = target_info.get('uid')
-        else:
-            uid = self.reader.read_tag(timeout=timeout)
+        try:
+            read_target = getattr(self.reader, 'read_target', None)
+            if read_target is not None:
+                target_info = read_target(timeout=timeout)
+                if target_info is not None:
+                    uid = target_info.get('uid')
+            else:
+                uid = self.reader.read_tag(timeout=timeout)
+        except pn532_driver.PN532I2CStatusError as e:
+            self.record_communication_error(e)
+            raise
+        self._record_communication_success()
         self.last_uid = uid
         self.last_target_info = target_info
         self.present = uid is not None
@@ -385,7 +416,12 @@ class MmuNfcReader:
         Preferred over read() for simple presence/UID polling - no separate
         release() is needed.
         """
-        uid = self.reader.read_tag(timeout=timeout)
+        try:
+            uid = self.reader.read_tag(timeout=timeout)
+        except pn532_driver.PN532I2CStatusError as e:
+            self.record_communication_error(e)
+            raise
+        self._record_communication_success()
         self.last_uid = uid
         self.present = uid is not None
         return uid
@@ -456,7 +492,12 @@ class MmuNfcReader:
         if not self.has_probe_support():
             return True
         try:
-            return bool(self.reader.probe_start())
+            started = bool(self.reader.probe_start())
+            self._record_communication_success()
+            return started
+        except pn532_driver.PN532I2CStatusError as e:
+            self.record_communication_error(e)
+            raise
         except Exception as e:
             reader_log.warning("[mmu_nfc_reader %s] probe_start failed: %s", self.name, e)
             return False
@@ -476,7 +517,12 @@ class MmuNfcReader:
         """
         if self.has_probe_support():
             try:
-                return self.reader.probe_poll()
+                result = self.reader.probe_poll()
+                self._record_communication_success()
+                return result
+            except pn532_driver.PN532I2CStatusError as e:
+                self.record_communication_error(e)
+                raise
             except Exception as e:
                 reader_log.warning("[mmu_nfc_reader %s] probe_poll failed: %s", self.name, e)
                 return False
@@ -495,6 +541,10 @@ class MmuNfcReader:
         if self.has_probe_support():
             try:
                 self.reader.probe_stop()
+                self._record_communication_success()
+            except pn532_driver.PN532I2CStatusError as e:
+                self.record_communication_error(e)
+                raise
             except Exception as e:
                 reader_log.warning("[mmu_nfc_reader %s] probe_stop failed: %s", self.name, e)
             return
@@ -530,7 +580,12 @@ class MmuNfcReader:
         if read_target is None:
             # Driver has no target concept - can't do a structured read
             return self.read_uid(timeout=timeout), None
-        target_info = read_target(timeout=timeout)
+        try:
+            target_info = read_target(timeout=timeout)
+        except pn532_driver.PN532I2CStatusError as e:
+            self.record_communication_error(e)
+            raise
+        self._record_communication_success()
         if target_info is None:
             self.last_uid = None
             self.last_target_info = None
@@ -546,6 +601,11 @@ class MmuNfcReader:
         metadata = None
         try:
             metadata = self._read_tag_metadata(target_info)
+        except pn532_driver.PN532I2CStatusError as e:
+            self.record_communication_error(e)
+            self.last_deep_error = str(e)
+            reader_log.warning("[mmu_nfc_reader %s] deep tag I2C read failed: %s",
+                               self.name, e)
         except Exception as e:
             self.last_deep_error = str(e) or e.__class__.__name__
             reader_log.warning("[mmu_nfc_reader %s] deep tag read failed: %s", self.name, e)
@@ -735,6 +795,10 @@ class MmuNfcReader:
             release_fn(reason=reason)
         except TypeError:
             release_fn()
+        except pn532_driver.PN532I2CStatusError as e:
+            self.record_communication_error(e)
+            raise
+        self._record_communication_success()
         self.present = False
         return True
 
@@ -789,6 +853,9 @@ class MmuNfcReader:
             'alive': self.alive,
             'present': self.present,
             'last_uid': self.last_uid,
+            'last_error': self.last_error,
+            'last_error_time': self.last_error_time,
+            'i2c_error_count': self.i2c_error_count,
         }
 
 

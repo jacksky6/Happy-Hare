@@ -37,6 +37,7 @@ from ..mmu_constants     import *
 from ..mmu_utils         import MmuError
 from .nfc.mmu_nfc_reader import MmuNfcReader
 from .nfc.mmu_nfc_endstop import MmuNfcEndstop
+from .nfc.pn532_driver   import PN532I2CStatusError
 
 NFC_CHECK_INTERVAL = 1.0   # How often to poll the shared NFC reader (seconds)
 NFC_READ_TIMEOUT   = 0.1   # Per-poll reader read timeout (seconds) - keep small; runs on reactor thread
@@ -121,6 +122,7 @@ class MmuNfcManager:
         # State reset on (re)initialization. Called by mmu_unit.reinit().
         self._last_uid = None   # UID currently "held" (deduped)
         self._hold_until = 0.0  # Monotonic time until which reads are ignored (cooldown)
+        self._homing_probe_error = None
         # Safety net: a probe reference that somehow outlived its drain would keep the
         # shared-reader poll suppressed indefinitely (see _movement_active). reinit only
         # runs on MMU enable/init, never mid-operation, so nothing legitimately pending
@@ -474,6 +476,10 @@ class MmuNfcManager:
             return False
         try:
             return reader.release(reason="mmu_nfc_command")
+        except PN532I2CStatusError as e:
+            self._report_communication_error(
+                reader, e, context='release', gate=gate)
+            return False
         except Exception as e:
             self.mmu.log_error("NFC: release error on reader '%s': %s" % (getattr(reader, 'name', '?'), str(e)))
             return False
@@ -494,6 +500,9 @@ class MmuNfcManager:
                 'alive': bool(getattr(reader, 'alive', False)),
                 'present': bool(getattr(reader, 'present', False)),
                 'uid': getattr(reader, 'last_uid', None),
+                'last_error': getattr(reader, 'last_error', None),
+                'last_error_time': getattr(reader, 'last_error_time', None),
+                'i2c_error_count': getattr(reader, 'i2c_error_count', 0),
             }
 
         status = {'unit': self.mmu_unit.name, 'polling': self._polling}
@@ -645,6 +654,40 @@ class MmuNfcManager:
         return result
 
 
+    def _report_communication_error(self, reader, error, context, gate=None):
+        """Expose a PN532 bus error as a non-fatal NFC warning."""
+        record = getattr(reader, 'record_communication_error', None)
+        if callable(record):
+            record(error)
+
+        reader_name = getattr(reader, 'name', error.reader_name)
+        if gate is None:
+            gate = getattr(reader, 'gate', None)
+        location = "gate %s " % gate if isinstance(gate, int) else ""
+        command = ("%s(0x%02X)" % (error.command, error.command_code)
+                   if error.command_code is not None else error.command)
+        transfer = ("I2C read_len=%d" % error.read_len
+                    if error.direction == 'read'
+                    else "I2C write_len=%d" % error.write_len)
+        continuations = {
+            'homing': ('Stopping NFC homing as if its endstop was triggered; '
+                       'no tag data is available.'),
+            'init': 'Reader unavailable; MMU operation continues.',
+            'release': 'Continuing without NFC release confirmation.',
+            'deep_read': 'Continuing without NFC tag metadata.',
+        }
+        continuation = continuations.get(context, 'Continuing without NFC data.')
+        message = (
+            "NFC warning: %sPN532 reader '%s' communication failed during %s: "
+            "%s at %s.%s (%s). %s"
+            % (location, reader_name, context, error.status, command,
+               error.phase, transfer, continuation))
+        if self.mmu is not None:
+            self.mmu.log_warning(message)
+        else:
+            logging.warning("MMU: %s", message)
+
+
     def _init_all_readers(self):
         # The shared reader is labelled with the unit name; per-gate readers with
         # their first logical gate number (a reader shared between two gates is
@@ -673,6 +716,10 @@ class MmuNfcManager:
                 self.mmu.log_debug("NFC: reader '%s' initialized (%s)" % (name, where))
             else:
                 self.mmu.log_warning("NFC: reader '%s' did not respond during init" % name)
+        except PN532I2CStatusError as e:
+            self._report_communication_error(
+                reader, e, context='init',
+                gate=gate if isinstance(gate, int) else None)
         except Exception as e:
             self.mmu.log_error("NFC: error initializing reader '%s': %s" % (name, str(e)))
 
@@ -785,6 +832,10 @@ class MmuNfcManager:
             else:
                 uid = reader.read_uid(timeout=NFC_READ_TIMEOUT)
                 metadata = None
+        except PN532I2CStatusError as e:
+            self._report_communication_error(
+                reader, e, context='deep_read' if deep else 'read')
+            return None, None
         except Exception as e:
             self.mmu.log_error("NFC: read error on reader '%s': %s" % (getattr(reader, 'name', '?'), str(e)))
             return None, None
@@ -890,9 +941,16 @@ class MmuNfcManager:
             return # Don't arm; the move will run full and home_wait reports no trigger
         self._homing_endstop = endstop
         self._probe_reader = endstop.reader
+        self._homing_probe_error = None
         try:
             endstop.reader.clear_uid()
             endstop.reader.probe_start()
+        except PN532I2CStatusError as e:
+            self._report_communication_error(
+                endstop.reader, e, context='homing', gate=endstop.gate)
+            # home_start() has not yet armed the virtual endstop completion.
+            # The first timer tick below will complete it without another I2C read.
+            self._homing_probe_error = e
         except Exception as e:
             self.mmu.log_error("NFC: homing probe start failed: %s" % str(e))
         self.reactor.update_timer(self._homing_poll_timer, self.reactor.NOW)
@@ -915,6 +973,14 @@ class MmuNfcManager:
         """
         self.reactor.update_timer(self._homing_poll_timer, self.reactor.NEVER)
         self._homing_endstop = None
+        self._homing_probe_error = None
+
+
+    def _complete_homing_on_communication_error(self, endstop, eventtime):
+        """End the move on a NFC transport fault without treating it as MMU failure."""
+        self._disarm_homing_poll()
+        endstop.trigger_handler(eventtime, True)
+        return self.reactor.NEVER
 
 
     def _drain_probe(self):
@@ -934,6 +1000,9 @@ class MmuNfcManager:
             return # Nothing in flight
         try:
             reader.probe_stop()
+        except PN532I2CStatusError as e:
+            self._report_communication_error(
+                reader, e, context='homing')
         except Exception as e:
             self.mmu.log_error("NFC: homing probe stop failed: %s" % str(e))
 
@@ -948,9 +1017,15 @@ class MmuNfcManager:
         endstop = self._homing_endstop
         if endstop is None:
             return self.reactor.NEVER
+        if self._homing_probe_error is not None:
+            return self._complete_homing_on_communication_error(endstop, eventtime)
         reader = endstop.reader
         try:
             found = reader.probe_poll()
+        except PN532I2CStatusError as e:
+            self._report_communication_error(
+                reader, e, context='homing', gate=endstop.gate)
+            return self._complete_homing_on_communication_error(endstop, eventtime)
         except Exception as e:
             self.mmu.log_error("NFC: homing probe error: %s" % str(e))
             found = False
@@ -980,6 +1055,10 @@ class MmuNfcManager:
             # scan is still in flight, so leave it alone and re-check.)
             try:
                 reader.probe_start()
+            except PN532I2CStatusError as e:
+                self._report_communication_error(
+                    reader, e, context='homing', gate=endstop.gate)
+                return self._complete_homing_on_communication_error(endstop, eventtime)
             except Exception as e:
                 self.mmu.log_error("NFC: homing probe restart failed: %s" % str(e))
 

@@ -140,6 +140,16 @@ _CMD_INLISTPASSIVETARGET = PN532_COMMAND_INLISTPASSIVETARGET
 _CMD_INDATAEXCHANGE = PN532_COMMAND_INDATAEXCHANGE
 _CMD_INRELEASE = PN532_COMMAND_INRELEASE
 
+_COMMAND_NAMES = {
+    _CMD_GETFIRMWAREVERSION: 'GetFirmwareVersion',
+    _CMD_WRITEREGISTER: 'WriteRegister',
+    _CMD_SAMCONFIGURATION: 'SAMConfiguration',
+    _CMD_RFCONFIGURATION: 'RFConfiguration',
+    _CMD_INDATAEXCHANGE: 'InDataExchange',
+    _CMD_INLISTPASSIVETARGET: 'InListPassiveTarget',
+    _CMD_INRELEASE: 'InRelease',
+}
+
 # InListPassiveTarget baud-rate/type codes
 _BRTY_ISO14443A_106KBPS  = 0x00   # Standard NFC Type A — covers NTAG and Mifare
 
@@ -157,6 +167,65 @@ _MAX_RESPONSE_BYTES = 32
 
 def _hex(data, sep=''):
     return sep.join('%02X' % b for b in data)
+
+
+def _command_name(command_code):
+    if command_code is None:
+        return 'unknown'
+    return _COMMAND_NAMES.get(command_code, 'Command0x%02X' % command_code)
+
+
+class PN532Error(Exception):
+    """Base class for PN532 driver failures."""
+
+
+class PN532I2CStatusError(PN532Error):
+    """A reportable Klipper I2C bus status, kept local to the NFC subsystem."""
+
+    def __init__(self, status, reader_name, operation, command_code, phase,
+                 direction, write_len=0, read_len=0, probe_stage=None,
+                 response=None):
+        self.status = str(status)
+        self.reader_name = reader_name
+        self.operation = operation or 'unknown'
+        self.command_code = command_code
+        self.command = _command_name(command_code)
+        self.phase = phase or 'unknown'
+        self.direction = direction
+        self.write_len = int(write_len)
+        self.read_len = int(read_len)
+        self.probe_stage = probe_stage
+        self.response = list(response or [])
+        command = ("%s(0x%02X)" % (self.command, command_code)
+                   if command_code is not None else self.command)
+        detail = ("I2C status=%s operation=%s command=%s phase=%s "
+                  "direction=%s write_len=%d read_len=%d"
+                  % (self.status, self.operation, command, self.phase,
+                     self.direction, self.write_len, self.read_len))
+        if probe_stage is not None:
+            detail += " probe_stage=%s" % probe_stage
+        if self.response:
+            detail += " response=%s" % _hex(self.response, sep=' ')
+        PN532Error.__init__(self, detail)
+
+    @property
+    def fingerprint(self):
+        return (self.reader_name, self.status, self.operation,
+                self.command_code, self.phase)
+
+    def as_dict(self):
+        return {
+            'reader_name': self.reader_name,
+            'status': self.status,
+            'operation': self.operation,
+            'command': self.command,
+            'command_code': self.command_code,
+            'phase': self.phase,
+            'direction': self.direction,
+            'write_len': self.write_len,
+            'read_len': self.read_len,
+            'probe_stage': self.probe_stage,
+        }
 
 
 def _parse_inlist_payload(payload):
@@ -229,6 +298,8 @@ class _PN532Base:
         # A fake clock whose sleep() advances the now() it reports makes those tests
         # free and their poll counts assertable.
         self._now            = time_fn if time_fn is not None else time.time
+        self._io_operation   = None
+        self._io_command_code = None
         self._clear_current_card()
         self._probe_reset_state()   # Non-blocking presence probe (homing) state
 
@@ -267,11 +338,19 @@ class _PN532Base:
     def _probe_reset_state(self):
         self._probe_stage = None     # None | 'ack' | 'response'
         self._probe_deadline = 0.0
+        if self._io_operation == 'probe':
+            self._io_operation = None
+            self._io_command_code = None
 
     def probe_start(self):
         """Start one InListPassiveTarget scan. Returns True if the send went out."""
+        self._io_operation = 'probe'
+        self._io_command_code = _CMD_INLISTPASSIVETARGET
         try:
             self._send([_CMD_INLISTPASSIVETARGET, 0x01, _BRTY_ISO14443A_106KBPS])
+        except PN532I2CStatusError:
+            self._probe_reset_state()
+            raise
         except Exception as e:
             if self._debug >= 3:
                 logger.info("[%s %s] probe_start: send failed: %s",
@@ -314,7 +393,7 @@ class _PN532Base:
                 return None
 
             payload = self._probe_fetch_response(0x4B, _MAX_RESPONSE_BYTES)
-            self._probe_stage = None
+            self._probe_reset_state()
             target_info = _parse_inlist_payload(payload)
             if target_info is None:
                 self._clear_current_card()
@@ -325,6 +404,9 @@ class _PN532Base:
                             self._name, self._transport_name,
                             target_info.get('uid'))
             return True
+        except PN532I2CStatusError:
+            self._probe_reset_state()
+            raise
         except Exception as e:
             if self._debug >= 3:
                 logger.info("[%s %s] probe_poll: failed: %s",
@@ -341,23 +423,31 @@ class _PN532Base:
         """
         self._probe_stage = None
         try:
-            self._probe_send_abort()
-        except Exception as e:
-            if self._debug >= 4:
-                logger.info("[%s %s] _probe_abort: abort write failed: %s",
-                            self._name, self._transport_name, e)
-            return
-        # Drain a response that may already have been queued before the abort
-        # landed, so it can't be mistaken for the next command's ACK. Bounded and
-        # best-effort - a few short yields, not a full blocking wait.
-        for _ in range(4):
             try:
-                if self._probe_status_ready():
-                    self._probe_fetch_response(0x4B, _MAX_RESPONSE_BYTES)
+                self._probe_send_abort()
+            except PN532I2CStatusError:
+                raise
+            except Exception as e:
+                if self._debug >= 4:
+                    logger.info("[%s %s] _probe_abort: abort write failed: %s",
+                                self._name, self._transport_name, e)
+                return
+            # Drain a response that may already have been queued before the abort
+            # landed, so it can't be mistaken for the next command's ACK. Bounded and
+            # best-effort - a few short yields, not a full blocking wait.
+            for _ in range(4):
+                try:
+                    if self._probe_status_ready():
+                        self._probe_fetch_response(0x4B, _MAX_RESPONSE_BYTES)
+                        break
+                except PN532I2CStatusError:
+                    raise
+                except Exception:
                     break
-            except Exception:
-                break
-            self._sleep(0.005)
+                self._sleep(0.005)
+        finally:
+            self._io_operation = None
+            self._io_command_code = None
 
     def probe_stop(self):
         """Abandon any scan in flight and leave the chip clean for read_target().
@@ -371,6 +461,8 @@ class _PN532Base:
             self._probe_abort()
         try:
             self._release_current_target(reason="probe_stop")
+        except PN532I2CStatusError:
+            raise
         except Exception as e:
             if self._debug >= 4:
                 logger.info("[%s %s] probe_stop: release failed: %s",
@@ -442,16 +534,23 @@ class _PN532Base:
         return [0x00, 0x00, 0xFF, length, lcs] + data + [dcs, 0x00]
 
     def _transceive(self, cmd_and_params, expected_cmd_resp,
-                    read_len=_MAX_RESPONSE_BYTES, timeout=1.0):
+                    read_len=_MAX_RESPONSE_BYTES, timeout=1.0,
+                    operation=None):
         """Send a command frame and return the parsed response payload."""
-        self._send(cmd_and_params)
-        if not self._read_ack(timeout=min(max(timeout, 0.050), 1.000)):
-            if self._debug >= 3:
-                logger.info("[%s %s] _transceive: no valid ACK for "
-                            "cmd=0x%02X", self._name, self._transport_name,
-                            cmd_and_params[0])
-            return None
-        return self._recv(expected_cmd_resp, read_len=read_len, timeout=timeout)
+        previous = self._io_operation, self._io_command_code
+        self._io_command_code = cmd_and_params[0]
+        self._io_operation = operation or _command_name(cmd_and_params[0])
+        try:
+            self._send(cmd_and_params)
+            if not self._read_ack(timeout=min(max(timeout, 0.050), 1.000)):
+                if self._debug >= 3:
+                    logger.info("[%s %s] _transceive: no valid ACK for "
+                                "cmd=0x%02X", self._name, self._transport_name,
+                                cmd_and_params[0])
+                return None
+            return self._recv(expected_cmd_resp, read_len=read_len, timeout=timeout)
+        finally:
+            self._io_operation, self._io_command_code = previous
 
     # ─────────────────────────────────────────────────────────────────────────
     # Low-level debug helpers (transport-agnostic portion)
@@ -541,7 +640,8 @@ class _PN532Base:
                     release_tg, reason)
             payload = self._transceive([_CMD_INRELEASE, release_tg], 0x53,
                                        read_len=12,
-                                       timeout=max(self._release_delay, 0.200))
+                                       timeout=max(self._release_delay, 0.200),
+                                       operation='release')
             if self._debug >= 4:
                 if payload is None:
                     logger.info("[%s %s] _release_current_target: "
@@ -553,6 +653,8 @@ class _PN532Base:
                                 "status=0x%02X",
                                 self._name, self._transport_name, status)
             return payload is not None
+        except PN532I2CStatusError:
+            raise
         except Exception as e:
             if self._debug >= 4:
                 logger.info("[%s %s] _release_current_target: "
@@ -950,6 +1052,7 @@ class _PN532Base:
 
         Returns True if the chip responded, False if all attempts failed.
         """
+        last_i2c_error = None
         for attempt in range(attempts):
             if self._debug >= 4:
                 logger.info(
@@ -973,6 +1076,12 @@ class _PN532Base:
                         "[%s %s] _wake_pn532: attempt %d — "
                         "no valid response",
                         self._name, self._transport_name, attempt + 1)
+            except PN532I2CStatusError as e:
+                last_i2c_error = e
+                if attempt > 0 or self._debug >= 4:
+                    logger.info(
+                        "[%s %s] _wake_pn532: attempt %d failed: %s",
+                        self._name, self._transport_name, attempt + 1, e)
             except Exception as e:
                 # A cold chip routinely misses the first attempt, so that one is
                 # trace-only; a later failure is worth reporting.
@@ -983,6 +1092,8 @@ class _PN532Base:
                         e, traceback.format_exc())
             self._sleep(0.050)
 
+        if last_i2c_error is not None:
+            raise last_i2c_error
         logger.warning("[%s %s] _wake_pn532: failed after %d attempts — "
                     "check wiring",
                     self._name, self._transport_name, attempts)
@@ -1043,6 +1154,8 @@ class _PN532Base:
         """
         try:
             return self.get_firmware_version() is not None
+        except PN532I2CStatusError:
+            raise
         except Exception as e:
             if self._debug >= 4:
                 logger.info("[%s %s] is_alive: error: %s\n%s",
@@ -1070,7 +1183,13 @@ class _PN532Base:
         str
             Tag UID as uppercase hex (8, 10, or 14 chars for 4-, 5-, 7-byte UIDs).
         None
-            No tag in the RF field, or a communication error occurred.
+            No tag in the RF field.
+
+        Raises
+        ------
+        PN532I2CStatusError
+            The MCU reported an I2C transport failure. The NFC manager converts
+            this to a non-fatal warning and a no-tag result.
         """
         try:
             target_info = self.read_target(timeout=timeout)
@@ -1085,6 +1204,8 @@ class _PN532Base:
                             self._name, self._transport_name, uid_hex)
 
             return uid_hex
+        except PN532I2CStatusError:
+            raise
         except Exception as e:
             if self._debug >= 3:
                 logger.info("[%s %s] read_tag: error "
@@ -1138,6 +1259,62 @@ class PN532Driver(_PN532Base):
         self._transport_name = 'pn532/i2c'
         super().__init__(name, transceive_delay, crc_delay, debug, low_level_debug,
                          sleep_fn=sleep_fn, time_fn=time_fn)
+        self.last_i2c_error = None
+        self._last_i2c_log_key = None
+        self._last_i2c_log_time = 0.0
+
+    @property
+    def i2c_status_supported(self):
+        """True when the connected MCU can return I2C errors without shutdown."""
+        return getattr(self._i2c, 'i2c_transfer_cmd', None) is not None
+
+    def _i2c_transfer_safe(self, write, read_len=0, phase=None,
+                           operation=None, command_code=None):
+        """Perform one I2C transfer without Klipper's status->shutdown wrapper."""
+        write = list(write)
+        operation = operation or self._io_operation or 'unknown'
+        if command_code is None:
+            command_code = self._io_command_code
+
+        if not self.i2c_status_supported:
+            if read_len:
+                params = self._i2c.i2c_read(write, read_len)
+                return list(bytearray(params.get('response', [])))
+            self._i2c.i2c_write(write)
+            return []
+
+        # This is intentionally the raw query command. MCU_I2C.i2c_transfer()
+        # invokes Klipper shutdown for the same non-SUCCESS statuses.
+        oid = getattr(self._i2c, 'oid', None)
+        if oid is None:
+            oid = self._i2c.get_oid()
+        params = self._i2c.i2c_transfer_cmd.send(
+            [oid, write, read_len], retry=True)
+        params = params or {}
+        status = params.get('i2c_bus_status', 'SUCCESS')
+        response = list(bytearray(params.get('response', [])))
+        if status != 'SUCCESS':
+            error = PN532I2CStatusError(
+                status=status,
+                reader_name=self._name,
+                operation=operation,
+                command_code=command_code,
+                phase=phase,
+                direction='read' if read_len else 'write',
+                write_len=len(write),
+                read_len=read_len,
+                probe_stage=self._probe_stage,
+                response=response)
+            self.last_i2c_error = error
+            now = self._now()
+            if (error.fingerprint != self._last_i2c_log_key or
+                    now - self._last_i2c_log_time >= 30.0):
+                logger.warning("[%s %s] I2C_ERROR %s",
+                               self._name, self._transport_name, error)
+                self._last_i2c_log_key = error.fingerprint
+                self._last_i2c_log_time = now
+            raise error
+        return response
 
     # ─────────────────────────────────────────────────────────────────────────
     # Frame parsing — I2C frames include a leading STATUS byte
@@ -1186,7 +1363,9 @@ class PN532Driver(_PN532Base):
             logger.info("[%s pn532/i2c] _send: TX  cmd=0x%02X  frame=%s",
                         self._name, cmd_and_params[0],
                         ' '.join('%02X' % b for b in frame))
-        self._i2c.i2c_write(frame)
+        self._i2c_transfer_safe(
+            frame, phase='command_write',
+            command_code=cmd_and_params[0] if cmd_and_params else None)
 
     # -- Non-blocking probe primitives (see _PN532Base) ----------------------
     #
@@ -1196,24 +1375,33 @@ class PN532Driver(_PN532Base):
 
     def _probe_status_ready(self):
         """True if the PN532 has a frame waiting (one 1-byte status read)."""
-        raw = bytearray(self._i2c.i2c_read([], 1)['response'])
+        phase = 'ack_status' if self._probe_stage == 'ack' else 'response_status'
+        raw = bytearray(self._i2c_transfer_safe(
+            [], 1, phase=phase, operation='probe',
+            command_code=_CMD_INLISTPASSIVETARGET))
         return (raw[0] if raw else 0xFF) == 0x01
 
     def _probe_fetch_ack(self):
         """Read and validate the ACK frame. Only call when status is ready."""
-        raw = bytearray(self._i2c.i2c_read([], 7)['response'])
+        raw = bytearray(self._i2c_transfer_safe(
+            [], 7, phase='ack_frame', operation='probe',
+            command_code=_CMD_INLISTPASSIVETARGET))
         # The I2C read includes the leading status byte, so a good ACK is
         # 0x01 followed by the 6 ACK bytes.
         return len(raw) >= 7 and raw[0] == 0x01 and list(raw[1:]) == PN532_ACK
 
     def _probe_fetch_response(self, expected_cmd_resp, read_len):
         """Read and parse a response frame. Only call when status is ready."""
-        raw = bytearray(self._i2c.i2c_read([], read_len)['response'])
+        raw = bytearray(self._i2c_transfer_safe(
+            [], read_len, phase='response_frame', operation='probe',
+            command_code=_CMD_INLISTPASSIVETARGET))
         return self._check_frame(raw, expected_cmd_resp)
 
     def _probe_send_abort(self):
         """Write a bare ACK frame to cancel the command in flight."""
-        self._i2c.i2c_write(list(PN532_ACK))
+        self._i2c_transfer_safe(
+            list(PN532_ACK), phase='abort', operation='probe',
+            command_code=_CMD_INLISTPASSIVETARGET)
 
     def _read_ack(self, timeout=1.0, poll_interval=0.005):
         """
@@ -1226,9 +1414,11 @@ class PN532Driver(_PN532Base):
         deadline = self._now() + timeout
         while self._now() < deadline:
             try:
-                ready_result = self._i2c.i2c_read([], 1)
-                ready_raw = bytearray(ready_result['response'])
+                ready_raw = bytearray(self._i2c_transfer_safe(
+                    [], 1, phase='ack_status'))
                 status = ready_raw[0] if ready_raw else 0xFF
+            except PN532I2CStatusError:
+                raise
             except Exception as e:
                 logger.error("[%s pn532/i2c] _read_ack: ready read failed: %s\n%s",
                           self._name, e, traceback.format_exc())
@@ -1241,8 +1431,8 @@ class PN532Driver(_PN532Base):
 
             if status == 0x01:
                 try:
-                    ack_result = self._i2c.i2c_read([], 7)
-                    raw = bytearray(ack_result['response'])
+                    raw = bytearray(self._i2c_transfer_safe(
+                        [], 7, phase='ack_frame'))
                     ack = list(raw[1:])
                     ok = len(raw) >= 7 and raw[0] == 0x01 and ack == PN532_ACK
                     if self._debug >= 4:
@@ -1251,6 +1441,8 @@ class PN532Driver(_PN532Base):
                                     ' '.join('%02X' % b for b in raw),
                                     ok)
                     return ok
+                except PN532I2CStatusError:
+                    raise
                 except Exception as e:
                     logger.error("[%s pn532/i2c] _read_ack: ACK read failed: %s\n%s",
                               self._name, e, traceback.format_exc())
@@ -1283,9 +1475,11 @@ class PN532Driver(_PN532Base):
         deadline = self._now() + timeout
         while self._now() < deadline:
             try:
-                result = self._i2c.i2c_read([], 1)
-                raw1 = bytearray(result['response'])
+                raw1 = bytearray(self._i2c_transfer_safe(
+                    [], 1, phase='response_status'))
                 pn_status = raw1[0] if raw1 else 0xFF
+            except PN532I2CStatusError:
+                raise
             except Exception as e:
                 logger.error("[%s pn532/i2c] _recv: poll failed: %s\n%s",
                           self._name, e, traceback.format_exc())
@@ -1299,8 +1493,8 @@ class PN532Driver(_PN532Base):
 
             if pn_status == 0x01:
                 try:
-                    params = self._i2c.i2c_read([], read_len)
-                    raw = bytearray(params['response'])
+                    raw = bytearray(self._i2c_transfer_safe(
+                        [], read_len, phase='response_frame'))
                     payload = self._check_frame(raw, expected_cmd_resp)
                     if self._debug >= 4:
                         status_byte = raw[0] if raw else 0xFF
@@ -1320,6 +1514,8 @@ class PN532Driver(_PN532Base):
                                 self._name, expected_cmd_resp, status_byte,
                                 ' '.join('%02X' % b for b in raw) if raw else '(empty)')
                     return payload
+                except PN532I2CStatusError:
+                    raise
                 except Exception as e:
                     logger.error("[%s pn532/i2c] _recv: DATA read failed: %s\n%s",
                               self._name, e, traceback.format_exc())
@@ -1345,7 +1541,8 @@ class PN532Driver(_PN532Base):
         """
         self._require_low_level_debug()
         payload = [b & 0xFF for b in data]
-        self._i2c.i2c_write(payload)
+        self._i2c_transfer_safe(
+            payload, phase='raw_debug', operation='raw_debug')
         return payload
 
     def low_level_raw_read(self, length):
@@ -1355,14 +1552,17 @@ class PN532Driver(_PN532Base):
         The first byte returned by PN532 I2C reads is the PN532 status byte.
         """
         self._require_low_level_debug()
-        result = self._i2c.i2c_read([], length)
-        return list(bytearray(result.get('response', [])))
+        return self._i2c_transfer_safe(
+            [], length, phase='raw_debug', operation='raw_debug')
 
     def low_level_command_write(self, cmd_and_params):
         """Build and write a PN532 command frame without reading ACK/response."""
         self._require_low_level_debug()
         frame = self.low_level_command_frame(cmd_and_params)
-        self._i2c.i2c_write(frame)
+        command_code = cmd_and_params[0] if cmd_and_params else None
+        self._i2c_transfer_safe(
+            frame, phase='raw_debug', operation='raw_debug',
+            command_code=command_code)
         return frame
 
     def low_level_ready_read(self):
